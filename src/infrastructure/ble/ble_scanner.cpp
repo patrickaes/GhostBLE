@@ -27,6 +27,7 @@
 #include "core/security/gatt_fingerprint.h"
 
 #include "core/findmy/findmy_payload_parser.h"
+#include "core/findmy/findmy_adv_parser.h"
 
 #include "utils/string_utils.h"
 
@@ -269,19 +270,11 @@ static IBeaconInfo parseIBeacon(const std::string& mfg) {
 //  Note: Cannot distinguish AirTag specifically from other Find My
 //        accessories (AirPods case, Chipolo, Pebblebee, etc.) — Apple
 //        designs all Find My devices to look identical in BLE advertising.
+//
+//  Parsing lives in core/findmy/findmy_adv_parser.h so it can be covered by
+//  the native test suite (test/test_findmy), the same way FmdnParser handles
+//  the Google side.
 // ============================================================
-static bool detectAppleFindMy(const std::string& mfg, bool& isOfflineFinding) {
-    isOfflineFinding = false;
-
-    if (mfg.size() < 3) return false;
-    if ((uint8_t)mfg[0] != 0x4C || (uint8_t)mfg[1] != 0x00) return false;
-
-    uint8_t continuityType = (uint8_t)mfg[2];
-    if (continuityType != 0x12) return false;
-
-    isOfflineFinding = (mfg.size() >= 25);
-    return true;
-}
 
 // ===========================================================================
 //  Helper: estimate physical distance from TX power and RSSI.
@@ -491,11 +484,13 @@ static bool parseDeviceInfo(
         // ============================================================
         // APPLE FIND MY TRACKER DETECTION
         // ============================================================
-        bool isOfflineFinding = false;
-        if (detectAppleFindMy(mfg, isOfflineFinding)) {
+        FindMyAdv::FindMyAdvResult findMy = FindMyAdv::parse(
+            reinterpret_cast<const uint8_t*>(mfg.data()), mfg.size());
+
+        if (findMy.detected) {
             DeviceContext::xpManager.awardXP(3.0f);
 
-            if (isOfflineFinding) {
+            if (findMy.separated) {
                 float estDist = powf(10.0f, (float)(DISTANCE_CONSTANT - ScanContext::rssi.load()) / (float)RSSI_CONSTANT);
 
                 String indent = StringUtils::indentFromTag(devTag);
@@ -513,15 +508,14 @@ static bool parseDeviceInfo(
                 }
                 LOG(LOG_TARGET, indent + " Raw data (" + String(mfg.size()) + " bytes): " + hexDump);
 
-                // Decode the offline-finding payload (skip the 4-byte
-                // "4C 00 12 19" company ID / type / length header).
-                if (mfg.size() >= 4 + 25) {
-                    const uint8_t* payloadStart =
-                        reinterpret_cast<const uint8_t*>(mfg.data()) + 4;
+                // Decode the offline-finding payload. The parser reports where
+                // the Find My message starts, so this no longer assumes it sits
+                // at a fixed offset behind the "4C 00 12 19" header.
+                const uint8_t* payloadStart =
+                    reinterpret_cast<const uint8_t*>(mfg.data()) + findMy.payloadOffset;
 
-                    FindMyPayload payload = parseFindMyPayload(payloadStart, mfg.size() - 4);
-                    LOG(LOG_TARGET, findMyDecodedSummary(payload, devTag));
-                }
+                FindMyPayload payload = parseFindMyPayload(payloadStart, findMy.payloadLength);
+                LOG(LOG_TARGET, findMyDecodedSummary(payload, devTag));
 
                 isSecurityOrTrackingDevice = true;
                 ScanContext::susDevice++;
